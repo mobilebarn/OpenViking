@@ -3,6 +3,7 @@
 """Sessions endpoints for OpenViking HTTP Server."""
 
 import asyncio
+import concurrent.futures
 import logging
 from typing import Any, Dict, List, Literal, Optional
 
@@ -21,6 +22,23 @@ from openviking_cli.exceptions import InvalidArgumentError
 
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 logger = logging.getLogger(__name__)
+
+# Thread pool for offloading long-running async work (VLM extraction, commits)
+# so it doesn't block the uvicorn event loop.
+_bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ov-bg")
+
+
+def _run_async_in_thread(coro):
+    """Run an async coroutine in a new event loop inside a thread pool worker.
+
+    This prevents long-running awaitable work (e.g. VLM calls that take
+    minutes) from blocking the main uvicorn event loop.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 class TextPartRequest(BaseModel):
@@ -231,11 +249,20 @@ async def commit_session(
 async def _background_commit_tracked(
     service, session_id: str, ctx: RequestContext, task_id: str
 ) -> None:
-    """Run session commit in background with task tracking."""
+    """Run session commit in background with task tracking.
+
+    The heavy VLM work is offloaded to a thread pool executor so it does
+    not block the main uvicorn event loop.
+    """
     tracker = get_task_tracker()
     tracker.start(task_id)
     try:
-        result = await service.sessions.commit_async(session_id, ctx)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            _bg_executor,
+            _run_async_in_thread,
+            service.sessions.commit_async(session_id, ctx),
+        )
         tracker.complete(
             task_id,
             {
@@ -313,11 +340,20 @@ async def extract_session(
 async def _background_extract_tracked(
     service, session_id: str, ctx: RequestContext, task_id: str
 ) -> None:
-    """Run session extraction in background with task tracking."""
+    """Run session extraction in background with task tracking.
+
+    The heavy VLM work is offloaded to a thread pool executor so it does
+    not block the main uvicorn event loop.
+    """
     tracker = get_task_tracker()
     tracker.start(task_id)
     try:
-        result = await service.sessions.extract(session_id, ctx)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            _bg_executor,
+            _run_async_in_thread,
+            service.sessions.extract(session_id, ctx),
+        )
         memories = _to_jsonable(result)
         tracker.complete(
             task_id,
